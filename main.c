@@ -1,11 +1,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_ttf.h>
-#include <mpi/mpi.h>
+#include "/opt/homebrew/Cellar/open-mpi/4.1.5/include/mpi.h"
 
-#include <malloc.h>
+#include "/opt/homebrew/Cellar/sdl2/2.28.3/include/SDL2/SDL.h"
+#include "/opt/homebrew/Cellar/sdl2_image/2.6.3_2/include/SDL2/SDL_image.h"
+#include "/opt/homebrew/Cellar/sdl2_ttf/2.20.2/include/SDL2/SDL_ttf.h"
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui/highgui.hpp>
@@ -13,22 +13,21 @@
 
 #include "utility.h"
 
-int PIXEL_SCALE = 12;
+int PIXEL_SCALE = 8;
 int operation_mode = 1;
 char video_path[256] {0};
-
+ 
 int width  = 0, 
     height = 0;
 
 #define ASCII_WIDTH width
 #define ASCII_HEIGHT height
 
-#define FONT_SIZE 16
+#define FONT_SIZE 4
 
 int nFrames,framerate = 0;
 
 MPI_Datatype sdl_color;
-
 
 cv::VideoCapture videoStream;
 int videoStreamIndex = -1;
@@ -52,25 +51,16 @@ const char asciiChars[] = " .:-=+*#%@";
 const int numChars = sizeof(asciiChars) - 1; // Numero di caratteri, escludendo il terminatore di stringa '\0'
 
 // Funzione per convertire il colore in scala di grigi
-uint8_t grayscale(uint8_t r, uint8_t g, uint8_t b) {
+inline uint8_t grayscale(uint8_t r, uint8_t g, uint8_t b) {
     return (r+g+b) / 3;
 }
 
 inline uint8_t getCharIndex(uint8_t grayscale){
-    uint8_t _val =  grayscale * numChars / 255;
-
-    // Assicurati che l'indice sia compreso nell'intervallo corretto
-    if (_val < 0) {
-        _val = 0;
-    } else if (_val >= numChars) {
-        _val = numChars - 1;
-    }
-
-    return _val;
+    return grayscale * numChars / 256;
 }
 
 // Funzione per ottenere il carattere ASCII corrispondente a un determinato valore di scala di grigi
-char getAsciiChar(uint8_t grayscale) {
+inline char getAsciiChar(uint8_t grayscale) {
     // Mappatura del valore di scala di grigi all'indice del carattere ASCII
     uint8_t index = getCharIndex(grayscale);
     return asciiChars[index];
@@ -121,30 +111,43 @@ void destroySDL(SDL_Window *window, SDL_Renderer *renderer, TTF_Font *font) {
     SDL_Quit();
 }
 
+SDL_Window *window = NULL;
+SDL_Renderer *renderer = NULL;
+TTF_Font *font = NULL;
 
-void processFrames(int rank, int size) {    
-    SDL_Window *window = NULL;
-    SDL_Renderer *renderer = NULL;
-    TTF_Font *font = NULL;
+unsigned char *imagePixels = NULL;
 
-    // Create 2D topology
-    int dims[2] = {0};
-    int periods[2] = {0};
-    int coords[2] = {0};
+unsigned char *allAsciiArtIdx = NULL;
+SDL_Color *allAsciiArtPixelColor = NULL; 
+SDL_Texture **asciiTextures = NULL;
+SDL_Color *asciiArtPixelColor = NULL;
+
+MPI_Comm comm2D;
+
+int rank_first, rank_last;
+int rank_up, rank_down;
+int localHeight;
+int localWidth;
+
+// Create 2D topology
+int dims[2] = {0};
+int periods[2] = {0};
+int coords[2] = {0};
+
+void init(int rank, int size){
 
     MPI_Type_contiguous(sizeof(SDL_Color) , MPI_BYTE , &sdl_color);
     MPI_Type_commit(&sdl_color);
 
-    int rank_first, rank_last;
-
+   
     MPI_Dims_create(size, 1, dims);
-    MPI_Comm comm2D;
+    
     MPI_Cart_create(MPI_COMM_WORLD, 1, dims, periods, 1, &comm2D);
     MPI_Comm_rank(comm2D, &rank);
     MPI_Comm_size(comm2D, &size);
     MPI_Cart_coords(comm2D, rank, 2, coords);
 
-    int rank_up, rank_down;
+    
     MPI_Cart_shift(comm2D, 0, 1, &rank_up, &rank_down);
 
     const int top_coords[] = {0};
@@ -153,80 +156,86 @@ void processFrames(int rank, int size) {
     MPI_Cart_rank(comm2D , top_coords , &rank_first);
     MPI_Cart_rank(comm2D , bottom_coords , &rank_last);
 
-    unsigned char *imagePixels = NULL;
-
-    unsigned char *allAsciiArtIdx = NULL;
-    SDL_Color *allAsciiArtPixelColor = NULL; 
-    SDL_Texture **asciiTextures = NULL;
-
-    #pragma region Variabili_Init
-        if (rank == rank_first) {
-            if (initOpenCV() != 0) {
-                printf("Failed to initialize OpenCV\n");
-                return;
-            }
-
-            framerate = videoStream.get(cv::CAP_PROP_FPS);
-            width = videoStream.get(cv::CAP_PROP_FRAME_WIDTH);
-            height = videoStream.get(cv::CAP_PROP_FRAME_HEIGHT);
-            nFrames = videoStream.get(cv::CAP_PROP_FRAME_COUNT);
-
-            allAsciiArtPixelColor = (SDL_Color *)malloc((ASCII_WIDTH * ASCII_HEIGHT + 1) * sizeof(SDL_Color));
-            allAsciiArtIdx = (unsigned char *)malloc((ASCII_WIDTH * ASCII_HEIGHT + 1) * sizeof(unsigned char) * 3);
-            asciiTextures = (SDL_Texture**)malloc(numChars * sizeof(SDL_Texture*));
-
-            memset(asciiTextures, 0, numChars * sizeof(SDL_Texture*));
-            memset(allAsciiArtIdx, 0, (ASCII_WIDTH * ASCII_HEIGHT + 1) * sizeof(unsigned char) * 3);
-            memset(allAsciiArtPixelColor, 0, (ASCII_WIDTH * ASCII_HEIGHT + 1) * sizeof(SDL_Color));
-
-            printf("%d, %d\n", width, height);
-
-            initializeSDL(&window, &renderer, &font);
-
-            SDL_Color textColor = {255, 255, 255, 255};
-            for (int i = 0; i < numChars; ++i){
-                SDL_Surface *asciiSurface = TTF_RenderText_Solid(font, &asciiChars[i], textColor);
-                asciiTextures[i] = SDL_CreateTextureFromSurface(renderer, asciiSurface);
-            }
-
+    if (rank == rank_first) {
+        if (initOpenCV() != 0) {
+            printf("Failed to initialize OpenCV\n");
+            return;
         }
 
-        MPI_Bcast(&width, 1, MPI_INT, rank_first, comm2D);
-        MPI_Bcast(&height, 1, MPI_INT, rank_first, comm2D);
-        MPI_Bcast(&nFrames, 1, MPI_INT, rank_first, comm2D);
-        MPI_Bcast(&framerate, 1, MPI_INT, rank_first, comm2D);
-    #pragma endregion 
+        framerate = videoStream.get(cv::CAP_PROP_FPS);
+        width = videoStream.get(cv::CAP_PROP_FRAME_WIDTH);
+        height = videoStream.get(cv::CAP_PROP_FRAME_HEIGHT);
+        nFrames = videoStream.get(cv::CAP_PROP_FRAME_COUNT);
 
-    int localHeight = ASCII_HEIGHT / dims[0];
-    int localWidth = ASCII_WIDTH ;
+        allAsciiArtPixelColor = (SDL_Color *)malloc((ASCII_WIDTH * ASCII_HEIGHT + 1) * sizeof(SDL_Color));
+        allAsciiArtIdx = (unsigned char *)malloc((ASCII_WIDTH * ASCII_HEIGHT + 1) * sizeof(unsigned char) * 3);
+        asciiTextures = (SDL_Texture**)malloc(numChars * sizeof(SDL_Texture*));
+
+        memset(asciiTextures, 0, numChars * sizeof(SDL_Texture*));
+        memset(allAsciiArtIdx, 0, (ASCII_WIDTH * ASCII_HEIGHT + 1) * sizeof(unsigned char) * 3);
+        memset(allAsciiArtPixelColor, 0, (ASCII_WIDTH * ASCII_HEIGHT + 1) * sizeof(SDL_Color));
+
+        printf("%d, %d\n", width, height);
+
+        if (operation_mode == GRAPHICS)
+            initializeSDL(&window, &renderer, &font);
+
+        SDL_Color textColor = {255, 255, 255, 255};
+        for (int i = 0; i < numChars; ++i){
+            SDL_Surface *asciiSurface = TTF_RenderText_Solid(font, &asciiChars[i], textColor);
+            asciiTextures[i] = SDL_CreateTextureFromSurface(renderer, asciiSurface);
+        }
+
+
+    }
+
+    MPI_Bcast(&width, 1, MPI_INT, rank_first, comm2D);
+    MPI_Bcast(&height, 1, MPI_INT, rank_first, comm2D);
+    MPI_Bcast(&nFrames, 1, MPI_INT, rank_first, comm2D);
+    MPI_Bcast(&framerate, 1, MPI_INT, rank_first, comm2D);
+
+    localHeight = ASCII_HEIGHT / dims[0];
+    localWidth = ASCII_WIDTH;
+
+    asciiArtPixelColor = (SDL_Color *)malloc((localWidth * localHeight + 1) * sizeof(SDL_Color));
+    memset(asciiArtPixelColor, 0, (localWidth * localHeight + 1) * sizeof(SDL_Color));
+}
+
+void processFrames(int rank, int size) { 
+
     int startX = 0;
     int startY = coords[0] * localHeight *localWidth;
 
     unsigned char *asciiArtIdx = 0;
-    
-    #pragma region Alloca_Memoria
-        SDL_Color *asciiArtPixelColor = (SDL_Color *)malloc((localWidth * localHeight + 1) * sizeof(SDL_Color));
-        memset(asciiArtPixelColor, 0, (localWidth * localHeight + 1) * sizeof(SDL_Color));
-        
-        if (rank != rank_first){
-            /*asciiArtIdx = (unsigned char *)malloc((localWidth * localHeight + 1) * sizeof(unsigned char));
-            memset(asciiArtIdx, 0, (localWidth * localHeight + 1) * sizeof(unsigned char));*/
-
-            asciiArtPixelColor = (SDL_Color *)malloc((localWidth * localHeight + 1) * sizeof(SDL_Color));
-            memset(asciiArtPixelColor, 0, (localWidth * localHeight + 1) * sizeof(SDL_Color));
-        }else{
-            asciiArtIdx = allAsciiArtIdx;
-            asciiArtPixelColor = allAsciiArtPixelColor;
-        }
-    #pragma edregion 
-
 
     int quit = 0;
     cv::Mat frame;
     SDL_Event event;
     MPI_Request request;
 
-    int frame_type = 16;
+    int thisRankFrameSize;
+    int thisRankFinalFrameSize = 0;
+
+    if (rank == rank_first){ 
+        asciiArtIdx = allAsciiArtIdx;
+
+        videoStream.set(cv::CAP_PROP_POS_FRAMES, 0);
+
+        if (!videoStream.read(frame)) {
+            printf("Failed to extract frame\n");
+            quit = 1;
+            MPI_Bcast(&quit, 1, MPI_INT, rank_first, comm2D);
+            return;
+        }
+
+        // Calcola la dimensione corretta della porzione di dati da inviare
+        int sendSize = (localHeight * localWidth * 3);
+
+        // Invia solo la porzione di dati richiesta a destra
+        for (int i = 0; i < size; i++)
+            if (i != rank_first)
+                MPI_Isend(&frame.data[localHeight * localWidth * 3 * i], sendSize, MPI_CHAR, i, 0, comm2D, &request);
+    }
     
     for (int i = 0, framesdecoded = 0; i < nFrames && quit == 0; i ++, framesdecoded += size){
         #pragma region Chiudi_Programma
@@ -245,61 +254,40 @@ void processFrames(int rank, int size) {
         #pragma endregion
         
         //L'immagine sarà trasmessa da sinistra verso destra (quindi non per forza il rank 0 sarà il primo)
-        
-            if (rank == rank_first) {
-                #pragma region Estrai_frame
 
-                    videoStream.set(cv::CAP_PROP_POS_FRAMES, i);
-
-                    if (!videoStream.read(frame)) {
-                        printf("Failed to extract frame\n");
-                        quit = 1;
-                        MPI_Bcast(&quit, 1, MPI_INT, rank_first, comm2D);
-                        break;
-                    }
-
-                    // Calcola la dimensione corretta della porzione di dati da inviare
-                    int sendSize = (ASCII_HEIGHT * ASCII_WIDTH * 3) - (localHeight * localWidth * 3);
-
-                    // Invia solo la porzione di dati richiesta a destra
-                    if (rank_down != rank_first) 
-                        MPI_Isend(&frame.data[localHeight * localWidth * 3], sendSize, MPI_CHAR, rank_down, 0, comm2D, &request);
-
-                #pragma endregion
-            } else {
+            if (rank != rank_first) {
                 #pragma region Ricevi_frame_e_invia_porzione
                     MPI_Status status;
 
                     // Ottieni la dimensione del messaggio in arrivo
-                    int recvSize;
-                    MPI_Probe(rank_up, 0, comm2D, &status);
-                    MPI_Get_count(&status, MPI_CHAR, &recvSize);
 
                     // Alloca la memoria necessaria per ricevere il messaggio
-                    if (imagePixels == NULL) 
-                        imagePixels = (uint8_t*)malloc(recvSize * sizeof(uint8_t));
-
+                    if (imagePixels == NULL) {
+                        MPI_Probe(rank_first, 0, comm2D, &status);
+                        MPI_Get_count(&status, MPI_CHAR, &thisRankFrameSize);
+                        imagePixels = (uint8_t*)malloc(thisRankFrameSize * sizeof(uint8_t));
+                    }
+                    
                     asciiArtIdx = imagePixels;
 
-                    // Ricevi il buffer dei pixel
-                    MPI_Recv(imagePixels, recvSize, MPI_CHAR, rank_up, 0, comm2D, &status);
 
-                    if (rank != rank_last) {
+                    // Ricevi il buffer dei pixel
+                    MPI_Recv(imagePixels, thisRankFrameSize, MPI_CHAR, rank_first, 0, comm2D, &status);
+
+                    /*if (rank != rank_last) {
                         // Calcola la dimensione corretta della porzione di dati da inviare
-                        int sendSize = recvSize - localHeight * localWidth * 3;
+                        int sendSize = thisRankFrameSize - localHeight * localWidth * 3;
 
                         // Invia solo la porzione di dati richiesta a destra
                         MPI_Isend(&imagePixels[localWidth * localHeight * 3], sendSize, MPI_CHAR, rank_down, 0, comm2D, &request);
-                    }
+                    }*/
+
                 #pragma endregion
             }
         
-
-
-        //if (rank != rank_first) frame = cv::Mat(localHeight, localWidth, CV_8UC3, imagePixels);
-        //forziamo il formato rgba dato che sdl_color ha bisogno di 4 valori distinti (rgb causa glithces)
-        //cv::cvtColor(frame, frame, cv::COLOR_RGB2RGBA);
         #pragma region Decodifica_frame
+            
+
             for (int y = 0; y < localHeight; y++) {
                 for (int x = 0; x < localWidth; x++) {
                     unsigned char* pixels = (imagePixels == NULL) ? &frame.data[(y * frame.cols + x) * 3] : &imagePixels[(y * localWidth + x) * 3];
@@ -316,36 +304,80 @@ void processFrames(int rank, int size) {
                     asciiArtPixelColor[y * localWidth + x] = c;
                 }
             }
+
+            /*if (rank == rank_first) {
+                double finaleTime = MPI_Wtime()-starttime;
+                printf("Time: %2.5f\n", finaleTime);
+            }*/
         #pragma endregion
        
-        if (operation_mode == GRAPHICS)
+        
         {
             //MPI_Gather(asciiArtIdx, localWidth * localHeight, MPI_CHAR, allAsciiArtIdx, localWidth * localHeight, MPI_CHAR, rank_first, comm2D);
             
+            if (rank == rank_first) {
+                videoStream.set(cv::CAP_PROP_POS_FRAMES, i+1);
+
+                if (!videoStream.read(frame)) {
+                    printf("Failed to extract frame\n");
+                    quit = 1;
+                    MPI_Bcast(&quit, 1, MPI_INT, rank_first, comm2D);
+                    break;
+                }
+
+                // Calcola la dimensione corretta della porzione di dati da inviare
+                int sendSize = (localHeight * localWidth * 3);
+
+                // Invia solo la porzione di dati richiesta a destra
+                for (int i = 0; i < size; i++)
+                    if (i != rank_first)
+                        MPI_Isend(&frame.data[localHeight * localWidth * 3 * i], sendSize, MPI_CHAR, i, 0, comm2D, &request);
+            }
+
             #pragma region Ricevi_Frame_Decodificato
-                if (rank == rank_last){
+                MPI_Gather(asciiArtPixelColor, localWidth * localHeight, sdl_color, allAsciiArtPixelColor, localWidth * localHeight, sdl_color, rank_first, comm2D);
+
+                if (rank != rank_first){
+                    MPI_Isend(asciiArtIdx, localHeight * localWidth, MPI_CHAR, rank_first, 0, comm2D, &request);
+                }else{
+                    MPI_Status status;
+                    for (int i = 0; i < size; i++){
+                        if (i != rank_first) {
+                            if (thisRankFinalFrameSize == 0){
+                                MPI_Probe(rank_down, 0, comm2D, &status);
+                                MPI_Get_count(&status, MPI_CHAR, &thisRankFinalFrameSize);
+                            }
+                               
+                            MPI_Recv(&allAsciiArtIdx[localWidth * localHeight * i], thisRankFinalFrameSize, MPI_CHAR, i, 0, comm2D, &status);
+                        }
+                    }
+                }
+                
+                /*if (rank == rank_last){
                     MPI_Isend(asciiArtIdx, localHeight * localWidth, MPI_CHAR, rank_up, 0, comm2D, &request);
                 }else{
                     
-                    int recvSize;
                     MPI_Status status;
-                    MPI_Probe(rank_down, 0, comm2D, &status);
-                    MPI_Get_count(&status, MPI_CHAR, &recvSize);
-                    
-                    //if (rank != rank_first) memcpy(imagePixels, asciiArtIdx, localWidth * localHeight);
+                    if (thisRankFinalFrameSize == 0){
+                        MPI_Probe(rank_down, 0, comm2D, &status);
+                        MPI_Get_count(&status, MPI_CHAR, &thisRankFinalFrameSize);
+                    }
 
-                    MPI_Recv((rank == rank_first) ? &allAsciiArtIdx[localWidth * localHeight] :
-                            &imagePixels[localWidth * localHeight], recvSize, MPI_CHAR, rank_down, 0, comm2D, &status);
+                    if (rank == rank_first)
+                        //MPI_Irecv(&allAsciiArtIdx[localWidth * localHeight], thisRankFinalFrameSize, MPI_CHAR, rank_down, 0, comm2D, &request);
+                        MPI_Recv(&allAsciiArtIdx[localWidth * localHeight], thisRankFinalFrameSize, MPI_CHAR, rank_down, 0, comm2D, &status);
+                    else
+                        MPI_Recv(&imagePixels[localWidth * localHeight], thisRankFinalFrameSize, MPI_CHAR, rank_down, 0, comm2D, &status);
                 
                     if (rank != rank_first)
-                        MPI_Isend(imagePixels, (localHeight * localWidth) + recvSize, MPI_CHAR, rank_up, 0, comm2D, &request);
-                }
+                        MPI_Isend(imagePixels, (localHeight * localWidth) + thisRankFinalFrameSize, MPI_CHAR, rank_up, 0, comm2D, &request);
+                }*/
 
-                MPI_Gather(asciiArtPixelColor, localWidth * localHeight, sdl_color, allAsciiArtPixelColor, localWidth * localHeight, sdl_color, rank_first, comm2D);
             #pragma endregion
-            
+
             #pragma region Display_Frame
-                if (rank == rank_first) {
+                if (rank == rank_first && operation_mode == GRAPHICS) {
+                    
                     SDL_RenderClear(renderer);
 
                     SDL_Rect destRect;
@@ -366,19 +398,15 @@ void processFrames(int rank, int size) {
                     }
 
                     SDL_RenderPresent(renderer);
+
                 }
-            }else if (rank == rank_first && i % 10 == 0){
-                printf("Done %d frames out of %d\n", i, nFrames);
+
+                if (rank == rank_first && i % 10 == 0){
+                    printf("Done %d frames out of %d\n", i, nFrames);
+                }
             }
         #pragma endregion
     }
-    
-    if (rank == rank_first) {
-        destroySDL(window, renderer, font);
-    }
-    
-    free(allAsciiArtIdx);
-    free(asciiTextures);
 }
 
 int parseVideoConfig(const char* filename, int* op_mode, int* scaleSize) {
@@ -436,8 +464,9 @@ void profiler(int rank, int size){
     operation_mode = 0;
     for (int i = 0; i < 10; ++i){
 
-        if(rank==0)
+        if(rank==0){
             starttime=MPI_Wtime();
+        }
         
         processFrames(rank, size);
         
@@ -452,6 +481,7 @@ void profiler(int rank, int size){
     printf("Con grafica\n");
 
     operation_mode = 1;
+    init(rank, size); 
     for (int i = 0; i < 10; ++i){
 
         if(rank==0)
@@ -475,15 +505,33 @@ int main(int argc, char *argv[]) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
+    printf("rank: %d\n", rank);
+
     if (parseVideoConfig("config.txt", &operation_mode, &PIXEL_SCALE)){
         printf("Impossible to parse the config file\n");
         return 0;
     }
 
+    init(rank, size); 
+
     if (operation_mode == 0){
         profiler(rank, size);
-    }else
+    }else{
+        double starttime=MPI_Wtime();
+
         processFrames(rank, size);
+
+        double finaleTime = MPI_Wtime()-starttime;
+        printf("Time: %2.5f\n", finaleTime);
+        printf("Time per frame: %2.5fms, correct frame ms: %2.5fms\n", (finaleTime/nFrames) * 1000, (1.f/framerate) * 1000);
+    }
+
+    if (rank == rank_first) {
+        destroySDL(window, renderer, font);
+    }
+    
+    free(allAsciiArtIdx);
+    free(asciiTextures);
 
     MPI_Finalize();
     return 0;
@@ -496,6 +544,9 @@ int main(int argc, char *argv[]) {
 //sudo apt install libopencv-dev
 //to compile it
 //mpic++ main.c -o a -lSDL2 -lSDL2_ttf -I/usr/include/opencv4 -lopencv_core -lopencv_imgproc -lopencv_video -lopencv_videoio
+//mac os:
+// export LIBRARY_PATH="$LIBRARY_PATH:/opt/homebrew/lib"
+// mpic++ main.c -o a -lSDL2 -lSDL2_ttf -I/opt/homebrew/Cellar/opencv/4.8.1/include/opencv4 -I/opt/homebrew/Cellar/sdl2/2.28.3/include/SDL2 -lopencv_core -lopencv_imgproc -lopencv_video -lopencv_videoio -std=c++11 -O3
 
 /*
 

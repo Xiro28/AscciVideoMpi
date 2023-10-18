@@ -1,4 +1,4 @@
 mode=0
-scale_size=4
-profiler=0
-video_path=video/test.mp4
+scale_size=2
+profiler=1
+video_path=video/video.mp4
