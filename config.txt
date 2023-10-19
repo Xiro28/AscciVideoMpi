@@ -1,4 +1,4 @@
 mode=0
 scale_size=2
 profiler=1
-video_path=video/video.mp4
+video_path=video/video2.mp4
